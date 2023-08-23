@@ -22,6 +22,6 @@ func newDS(t *testing.T) (ds.Datastore, func()) {
 func TestSuite(t *testing.T) {
 	d, done := newDS(t)
 	defer done()
-
+	// run datastore test suite.
 	dstest.SubtestAll(t, d)
 }

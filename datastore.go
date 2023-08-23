@@ -6,13 +6,13 @@ import (
 	"strings"
 
 	"github.com/go-bond/bond"
-	"github.com/go-bond/bond/cond"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
+	"github.com/jbenet/goprocess"
 )
 
 type DatastoreEntry struct {
-	Key   ds.Key
+	Key   string
 	Value []byte
 }
 
@@ -32,7 +32,7 @@ func NewDataStore(path string, opt *bond.Options) (*Datastore, error) {
 		DB:      db,
 		TableID: bond.TableID(1),
 		TablePrimaryKeyFunc: func(builder bond.KeyBuilder, t *DatastoreEntry) []byte {
-			builder = builder.AddStringField(t.Key.String())
+			builder = builder.AddStringField(t.Key)
 			return builder.Bytes()
 		},
 	})
@@ -64,7 +64,11 @@ func (d *Datastore) Query(ctx context.Context, q query.Query) (query.Results, er
 
 func (d *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 	txn, _ := d.NewTransaction(ctx, false)
-	return txn.Put(ctx, key, value)
+	err := txn.Put(ctx, key, value)
+	if err != nil {
+		return err
+	}
+	return txn.Commit(ctx)
 }
 
 func (d *Datastore) Delete(ctx context.Context, key ds.Key) error {
@@ -105,17 +109,17 @@ func (t *txn) Put(ctx context.Context, key ds.Key, value []byte) error {
 	if t.readOnly {
 		return fmt.Errorf("readonly txn")
 	}
-	return t.table.Upsert(ctx, []*DatastoreEntry{{Key: key, Value: value}}, func(old, new *DatastoreEntry) *DatastoreEntry {
+	return t.table.Upsert(ctx, []*DatastoreEntry{{Key: key.String(), Value: value}}, func(old, new *DatastoreEntry) *DatastoreEntry {
 		return new
 	}, t.batch)
 }
 
 func (t *txn) Delete(ctx context.Context, key ds.Key) error {
-	return t.table.Delete(ctx, []*DatastoreEntry{{Key: key}})
+	return t.table.Delete(ctx, []*DatastoreEntry{{Key: key.String()}}, t.batch)
 }
 
 func (t *txn) Get(ctx context.Context, key ds.Key) ([]byte, error) {
-	entries, err := t.table.Get(ctx, bond.NewSelectorPoint[*DatastoreEntry](&DatastoreEntry{Key: key}), t.batch)
+	entries, err := t.table.Get(ctx, bond.NewSelectorPoint[*DatastoreEntry](&DatastoreEntry{Key: key.String()}), t.batch)
 	if err == nil {
 		return entries[0].Value, nil
 	}
@@ -126,64 +130,106 @@ func (t *txn) Get(ctx context.Context, key ds.Key) ([]byte, error) {
 }
 
 func (t *txn) Query(ctx context.Context, userQuery query.Query) (query.Results, error) {
-	q := t.table.Query()
+	prefix := ds.NewKey(userQuery.Prefix).String()
+	if prefix != "/" {
+		prefix = prefix + "/"
+	}
+	reverse := false
 
 	if len(userQuery.Orders) > 0 {
-		q = q.Order(func(r, r2 *DatastoreEntry) bool {
-			return query.Less(userQuery.Orders, query.Entry{
-				Key:   r.Key.String(),
-				Value: r.Value,
-				Size:  len(r.Value),
-			}, query.Entry{
-				Key:   r2.Key.String(),
-				Value: r2.Value,
-				Size:  len(r2.Value),
-			})
-		})
-	}
+		switch userQuery.Orders[0].(type) {
+		case query.OrderByKey, *query.OrderByKey:
+		// We order by key by default.
+		case query.OrderByKeyDescending, *query.OrderByKeyDescending:
+			// Reverse order by key
+			reverse = true
+		default:
+			// Skip the stuff we can't apply.
+			baseQuery := userQuery
+			baseQuery.Limit = 0
+			baseQuery.Offset = 0
+			baseQuery.Orders = nil
 
-	if len(userQuery.Filters) > 0 {
-		conds := []cond.Cond[*DatastoreEntry]{}
-		for _, filter := range userQuery.Filters {
-			conds = append(conds, cond.Func(func(r *DatastoreEntry) bool {
-				return filter.Filter(query.Entry{
-					Key:   r.Key.String(),
-					Value: r.Value,
-					Size:  len(r.Value),
-				})
-			}))
+			// perform the base query.
+			res, err := t.Query(ctx, baseQuery)
+			if err != nil {
+				return nil, err
+			}
+
+			// fix the query
+			res = query.ResultsReplaceQuery(res, userQuery)
+
+			// Remove the parts we've already applied.
+			naiveQuery := userQuery
+			naiveQuery.Prefix = ""
+			naiveQuery.Filters = nil
+
+			// Apply the rest of the query
+			return query.NaiveQueryApply(naiveQuery, res), nil
 		}
-		q = q.Filter(cond.And(conds...))
 	}
 
-	if userQuery.Limit != 0 {
-		q = q.Limit(uint64(userQuery.Limit))
-	}
+	qrb := query.NewResultBuilder(userQuery)
 
-	if userQuery.Offset != 0 {
-		q = q.Offset(uint64(userQuery.Offset))
-	}
+	qrb.Process.Go(func(proc goprocess.Process) {
+		skipped := 0
+		sent := 0
+		t.table.ScanIndexForEach(ctx, t.table.PrimaryIndex(), bond.NewSelectorPoint(&DatastoreEntry{Key: prefix}),
+			func(keyBytes bond.KeyBytes, t bond.Lazy[*DatastoreEntry]) (bool, error) {
+				key := string(keyBytes.ToKey().PrimaryKey)[1:]
+				if !strings.HasPrefix(key, prefix) {
+					return false, nil
+				}
+				// skip if offset is applied.
+				if skipped < userQuery.Offset && len(userQuery.Filters) == 0 {
+					skipped++
+					return true, nil
+				}
 
-	if userQuery.Prefix != "" {
-		q.With(t.table.PrimaryIndex(), bond.NewSelectorRange(&DatastoreEntry{Key: ds.NewKey(userQuery.Prefix)}, &DatastoreEntry{Key: ds.NewKey(userQuery.Prefix)}))
-	}
+				var entry query.Entry
+				if userQuery.KeysOnly {
+					entry = query.Entry{
+						Key: key,
+					}
+				} else {
+					item, err := t.Get()
+					if err != nil {
+						qrb.Output <- query.Result{Error: err}
+						return false, nil
+					}
+					entry = query.Entry{
+						Key:   item.Key,
+						Value: item.Value,
+						Size:  len(item.Value),
+					}
+				}
 
-	var out []*DatastoreEntry
-	err := q.Execute(ctx, &out, t.batch)
-	if err != nil {
-		builder := query.NewResultBuilder(userQuery)
-		return builder.Results(), err
-	}
+				// we must go through filter to apply offset.
+				if skipped < userQuery.Offset {
+					if !filter(userQuery.Filters, entry) {
+						skipped++
+					}
+					return true, nil
+				}
 
-	var entries []query.Entry
-	for _, entry := range out {
-		entries = append(entries, query.Entry{
-			Key:   entry.Key.String(),
-			Value: entry.Value,
-			Size:  len(entry.Value),
-		})
-	}
-	return query.ResultsWithEntries(userQuery, entries), nil
+				if userQuery.Limit != 0 && sent >= userQuery.Limit {
+					return false, nil
+				}
+
+				if len(userQuery.Filters) > 0 && filter(userQuery.Filters, entry) {
+					return true, nil
+				}
+				qrb.Output <- query.Result{
+					Entry: entry,
+				}
+				sent++
+				return true, nil
+			}, reverse, t.batch)
+	})
+
+	go qrb.Process.CloseAfterChildren()
+
+	return qrb.Results(), nil
 }
 
 func (t *txn) Has(ctx context.Context, key ds.Key) (bool, error) {
@@ -200,7 +246,7 @@ func (t *txn) Has(ctx context.Context, key ds.Key) (bool, error) {
 func (t *txn) GetSize(ctx context.Context, key ds.Key) (int, error) {
 	entry, err := t.Get(ctx, key)
 	if err != nil {
-		return 0, err
+		return -1, err
 	}
 	return len(entry), nil
 }
@@ -211,4 +257,13 @@ func (t *txn) Commit(ctx context.Context) error {
 
 func (t *txn) Discard(ctx context.Context) {
 	t.batch.Reset()
+}
+
+func filter(filters []query.Filter, entry query.Entry) bool {
+	for _, f := range filters {
+		if !f.Filter(entry) {
+			return true
+		}
+	}
+	return false
 }
