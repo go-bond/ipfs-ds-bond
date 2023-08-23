@@ -1,7 +1,5 @@
 module github.com/go-bond/ipfs-ds-bond
 
-replace github.com/ipfs/go-datastore => /home/saint/go-datastore
-
 
 go 1.20
 
