@@ -73,7 +73,11 @@ func (d *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 
 func (d *Datastore) Delete(ctx context.Context, key ds.Key) error {
 	txn, _ := d.NewTransaction(ctx, false)
-	return txn.Delete(ctx, key)
+	err := txn.Delete(ctx, key)
+	if err != nil {
+		return err
+	}
+	return txn.Commit(ctx)
 }
 
 func (d *Datastore) Sync(ctx context.Context, _ ds.Key) error {
@@ -174,7 +178,7 @@ func (t *txn) Query(ctx context.Context, userQuery query.Query) (query.Results, 
 	qrb.Process.Go(func(proc goprocess.Process) {
 		skipped := 0
 		sent := 0
-		t.table.ScanIndexForEach(ctx, t.table.PrimaryIndex(), bond.NewSelectorPoint(&DatastoreEntry{Key: prefix}),
+		err := t.table.ScanIndexForEach(ctx, t.table.PrimaryIndex(), bond.NewSelectorPoint(&DatastoreEntry{Key: prefix}),
 			func(keyBytes bond.KeyBytes, t bond.Lazy[*DatastoreEntry]) (bool, error) {
 				key := string(keyBytes.ToKey().PrimaryKey)[1:]
 				if !strings.HasPrefix(key, prefix) {
@@ -194,8 +198,7 @@ func (t *txn) Query(ctx context.Context, userQuery query.Query) (query.Results, 
 				} else {
 					item, err := t.Get()
 					if err != nil {
-						qrb.Output <- query.Result{Error: err}
-						return false, nil
+						return false, err
 					}
 					entry = query.Entry{
 						Key:   item.Key,
@@ -225,6 +228,9 @@ func (t *txn) Query(ctx context.Context, userQuery query.Query) (query.Results, 
 				sent++
 				return true, nil
 			}, reverse, t.batch)
+		if err != nil {
+			qrb.Output <- query.Result{Error: err}
+		}
 	})
 
 	go qrb.Process.CloseAfterChildren()
