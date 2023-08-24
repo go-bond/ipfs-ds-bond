@@ -8,7 +8,6 @@ import (
 	"github.com/go-bond/bond"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
-	"github.com/jbenet/goprocess"
 )
 
 type DatastoreEntry struct {
@@ -173,69 +172,60 @@ func (t *txn) Query(ctx context.Context, userQuery query.Query) (query.Results, 
 		}
 	}
 
-	qrb := query.NewResultBuilder(userQuery)
-
-	qrb.Process.Go(func(proc goprocess.Process) {
-		skipped := 0
-		sent := 0
-		err := t.table.ScanIndexForEach(ctx, t.table.PrimaryIndex(), bond.NewSelectorPoint(&DatastoreEntry{Key: prefix}),
-			func(keyBytes bond.KeyBytes, t bond.Lazy[*DatastoreEntry]) (bool, error) {
-				key := string(keyBytes.ToKey().PrimaryKey)[1:]
-				if !strings.HasPrefix(key, prefix) {
-					return false, nil
-				}
-				// skip if offset is applied.
-				if skipped < userQuery.Offset && len(userQuery.Filters) == 0 {
-					skipped++
-					return true, nil
-				}
-
-				var entry query.Entry
-				if userQuery.KeysOnly {
-					entry = query.Entry{
-						Key: key,
-					}
-				} else {
-					item, err := t.Get()
-					if err != nil {
-						return false, err
-					}
-					entry = query.Entry{
-						Key:   item.Key,
-						Value: item.Value,
-						Size:  len(item.Value),
-					}
-				}
-
-				// we must go through filter to apply offset.
-				if skipped < userQuery.Offset {
-					if !filter(userQuery.Filters, entry) {
-						skipped++
-					}
-					return true, nil
-				}
-
-				if userQuery.Limit != 0 && sent >= userQuery.Limit {
-					return false, nil
-				}
-
-				if len(userQuery.Filters) > 0 && filter(userQuery.Filters, entry) {
-					return true, nil
-				}
-				qrb.Output <- query.Result{
-					Entry: entry,
-				}
-				sent++
+	var entires []query.Entry
+	skipped := 0
+	err := t.table.ScanIndexForEach(ctx, t.table.PrimaryIndex(), bond.NewSelectorPoint(&DatastoreEntry{Key: prefix}),
+		func(keyBytes bond.KeyBytes, t bond.Lazy[*DatastoreEntry]) (bool, error) {
+			key := string(keyBytes.ToKey().PrimaryKey)[1:]
+			if !strings.HasPrefix(key, prefix) {
+				return false, nil
+			}
+			// skip if offset is applied.
+			if skipped < userQuery.Offset && len(userQuery.Filters) == 0 {
+				skipped++
 				return true, nil
-			}, reverse, t.batch)
-		if err != nil {
-			qrb.Output <- query.Result{Error: err}
-		}
-	})
+			}
 
-	go qrb.Process.CloseAfterChildren()
+			var entry query.Entry
+			if userQuery.KeysOnly {
+				entry = query.Entry{
+					Key: key,
+				}
+			} else {
+				item, err := t.Get()
+				if err != nil {
+					return false, err
+				}
+				entry = query.Entry{
+					Key:   item.Key,
+					Value: item.Value,
+					Size:  len(item.Value),
+				}
+			}
 
-	return qrb.Results(), nil
+			// we must go through filter to apply offset.
+			if skipped < userQuery.Offset {
+				if !filter(userQuery.Filters, entry) {
+					skipped++
+				}
+				return true, nil
+			}
+
+			if userQuery.Limit != 0 && len(entires) >= userQuery.Limit {
+				return false, nil
+			}
+
+			if len(userQuery.Filters) > 0 && filter(userQuery.Filters, entry) {
+				return true, nil
+			}
+			entires = append(entires, entry)
+			return true, nil
+		}, reverse, t.batch)
+	if err != nil {
+		return nil, err
+	}
+
+	return query.ResultsWithEntries(userQuery, entires), nil
 }
 
 func (t *txn) Has(ctx context.Context, key ds.Key) (bool, error) {
